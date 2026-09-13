@@ -288,6 +288,7 @@ fn wire_format_checks() {
             ciphersuite,
             &mut message_secrets,
             0,
+            &SenderRatchetConfiguration::default(),
             #[cfg(feature = "virtual-clients-draft")]
             None,
         )

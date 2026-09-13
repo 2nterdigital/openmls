@@ -1,8 +1,228 @@
 #[cfg(feature = "virtual-clients-draft")]
-use crate::tree::dual_use_ratchet::DualUseRatchet;
+use crate::binary_tree::{array_representation::TreeSize, LeafNodeIndex};
+#[cfg(feature = "virtual-clients-draft")]
+use crate::tree::dual_use_ratchet::{DualUseRatchet, GenerationLaneContext};
 use crate::{
-    ciphersuite::Secret, test_utils::*, tree::secret_tree::SecretTreeError, tree::sender_ratchet::*,
+    ciphersuite::Secret,
+    test_utils::*,
+    tree::{secret_tree::SecretTreeError, sender_ratchet::*},
 };
+
+#[cfg(feature = "virtual-clients-draft")]
+use openmls_traits::{
+    crypto::OpenMlsCrypto,
+    types::{
+        AeadType, CryptoError, ExporterSecret, HashType, HpkeCiphertext, HpkeConfig, HpkeKeyPair,
+        KemOutput, SignatureScheme,
+    },
+};
+#[cfg(feature = "virtual-clients-draft")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "virtual-clients-draft")]
+use tls_codec::SecretVLBytes;
+
+#[cfg(feature = "virtual-clients-draft")]
+pub(super) struct FailingCrypto {
+    inner: openmls_rust_crypto::RustCrypto,
+    fail_at_expand: usize,
+    expand_calls: AtomicUsize,
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+impl FailingCrypto {
+    pub(super) fn failing_on_expand(fail_at_expand: usize) -> Self {
+        Self {
+            inner: openmls_rust_crypto::RustCrypto::default(),
+            fail_at_expand,
+            expand_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+impl OpenMlsCrypto for FailingCrypto {
+    fn supports(&self, _ciphersuite: Ciphersuite) -> Result<(), CryptoError> {
+        Err(CryptoError::UnsupportedCiphersuite)
+    }
+
+    fn supported_ciphersuites(&self) -> Vec<Ciphersuite> {
+        Vec::new()
+    }
+
+    fn hkdf_extract(
+        &self,
+        _hash_type: HashType,
+        _salt: &[u8],
+        _ikm: &[u8],
+    ) -> Result<SecretVLBytes, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hmac(
+        &self,
+        _hash_type: HashType,
+        _key: &[u8],
+        _message: &[u8],
+    ) -> Result<SecretVLBytes, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hkdf_expand(
+        &self,
+        hash_type: HashType,
+        prk: &[u8],
+        info: &[u8],
+        okm_len: usize,
+    ) -> Result<SecretVLBytes, CryptoError> {
+        let call = self.expand_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call == self.fail_at_expand {
+            return Err(CryptoError::CryptoLibraryError);
+        }
+        self.inner.hkdf_expand(hash_type, prk, info, okm_len)
+    }
+
+    fn hash(&self, _hash_type: HashType, _data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn aead_encrypt(
+        &self,
+        _alg: AeadType,
+        _key: &[u8],
+        _data: &[u8],
+        _nonce: &[u8],
+        _aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn aead_decrypt(
+        &self,
+        _alg: AeadType,
+        _key: &[u8],
+        _ct_tag: &[u8],
+        _nonce: &[u8],
+        _aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn signature_key_gen(&self, _alg: SignatureScheme) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn verify_signature(
+        &self,
+        _alg: SignatureScheme,
+        _data: &[u8],
+        _pk: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn sign(
+        &self,
+        _alg: SignatureScheme,
+        _data: &[u8],
+        _key: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hpke_seal(
+        &self,
+        _config: HpkeConfig,
+        _pk_r: &[u8],
+        _info: &[u8],
+        _aad: &[u8],
+        _ptxt: &[u8],
+    ) -> Result<HpkeCiphertext, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hpke_open(
+        &self,
+        _config: HpkeConfig,
+        _input: &HpkeCiphertext,
+        _sk_r: &[u8],
+        _info: &[u8],
+        _aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hpke_setup_sender_and_export(
+        &self,
+        _config: HpkeConfig,
+        _pk_r: &[u8],
+        _info: &[u8],
+        _exporter_context: &[u8],
+        _exporter_length: usize,
+    ) -> Result<(KemOutput, ExporterSecret), CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn hpke_setup_receiver_and_export(
+        &self,
+        _config: HpkeConfig,
+        _enc: &[u8],
+        _sk_r: &[u8],
+        _info: &[u8],
+        _exporter_context: &[u8],
+        _exporter_length: usize,
+    ) -> Result<ExporterSecret, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn derive_hpke_keypair(
+        &self,
+        _config: HpkeConfig,
+        _ikm: &[u8],
+    ) -> Result<HpkeKeyPair, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    #[cfg(feature = "targeted-messages-draft")]
+    fn hpke_open_psk(
+        &self,
+        _config: HpkeConfig,
+        _input: &HpkeCiphertext,
+        _sk_r: &[u8],
+        _info: &[u8],
+        _aad: &[u8],
+        _psk: &[u8],
+        _psk_id: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    #[cfg(feature = "targeted-messages-draft")]
+    fn hpke_seal_psk_resolved_aad<F, E>(
+        &self,
+        _config: HpkeConfig,
+        _pk_r: &[u8],
+        _info: &[u8],
+        _ptxt: &[u8],
+        _psk: &[u8],
+        _psk_id: &[u8],
+        _aad_builder: F,
+    ) -> Result<HpkeCiphertext, openmls_traits::crypto::HpkeSealPskResolvedAadError<E>>
+    where
+        Self: Sized,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+    {
+        unimplemented!("unused by the ratchet atomicity test")
+    }
+
+    fn ff1_aes128_encrypt(&self, _key: &[u8; 16], _plaintext: u32) -> Result<u32, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+
+    fn ff1_aes128_decrypt(&self, _key: &[u8; 16], _ciphertext: u32) -> Result<u32, CryptoError> {
+        Err(CryptoError::CryptoLibraryError)
+    }
+}
 
 // Test the maximum forward ratcheting
 #[openmls_test::openmls_test]
@@ -431,4 +651,342 @@ fn dual_use_local_sends_do_not_advance_receive_window() {
             configuration,
         )
         .expect("Local sends should not prune the receive window.");
+}
+
+// A lane send must derive the first generation belonging to the emulation
+// leaf, retain skipped generations for a sibling's ciphertext, and return
+// only the selected generation as the outgoing encryption secret.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_retains_skipped_generations() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    let lane = GenerationLaneContext::new(TreeSize::new(2), LeafNodeIndex::new(1));
+
+    let (generation, _) = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            configuration,
+        )
+        .expect("Expected the leaf-1 lane to select generation 1.");
+
+    assert_eq!(generation, 1);
+    assert_eq!(ratchet.generation(), 2);
+
+    // Generation 0 was skipped, but remains available to decrypt a sibling's
+    // message. The selected generation is also available until confirmation.
+    ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 0, configuration)
+        .expect("Skipped generation must be retained for decryption.");
+    ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 1, configuration)
+        .expect("Selected generation must remain available until confirmation.");
+}
+
+// A lane's stride must fit both sender-ratchet windows. This validation must
+// happen before any ratcheting so a rejected send leaves the head unchanged.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_rejects_stride_larger_than_sender_windows() {
+    let provider = &Provider::default();
+    let configuration = SenderRatchetConfiguration::new(1, 10);
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    // Three requested leaves round up to a four-leaf TreeSize, so the lane
+    // stride is three (N_e - 1), not two.
+    let lane = GenerationLaneContext::new(TreeSize::from_leaf_count(3), LeafNodeIndex::new(0));
+
+    let err = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            &configuration,
+        )
+        .expect_err("A stride of three must exceed the configured tolerance of one.");
+
+    assert_eq!(err, SecretTreeError::GenerationLaneTooWide);
+    assert_eq!(ratchet.generation(), 0);
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_rejects_stride_larger_than_forward_distance() {
+    let provider = &Provider::default();
+    let configuration = SenderRatchetConfiguration::new(10, 2);
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    let lane = GenerationLaneContext::new(TreeSize::from_leaf_count(3), LeafNodeIndex::new(0));
+
+    let err = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            &configuration,
+        )
+        .expect_err("A stride of three must exceed the maximum forward distance of two.");
+
+    assert_eq!(err, SecretTreeError::GenerationLaneTooWide);
+    assert_eq!(ratchet.generation(), 0);
+}
+
+// A malformed binding must never be used to derive a modulo or to select a
+// generation. Both the residue and emulation group size are validated at the
+// generation-lane boundary.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_rejects_invalid_residue() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    let lane = GenerationLaneContext::new(TreeSize::from_leaf_count(1), LeafNodeIndex::new(2));
+
+    let err = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            configuration,
+        )
+        .expect_err("A residue equal to the lane size must be rejected.");
+
+    assert_eq!(err, SecretTreeError::GenerationLaneInvalidResidue);
+    assert_eq!(ratchet.generation(), 0);
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_rejects_max_target_before_mutation() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    ratchet.set_generation_for_test(u32::MAX - 1);
+    let lane = GenerationLaneContext::new(TreeSize::new(2), LeafNodeIndex::new(1));
+
+    let err = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            configuration,
+        )
+        .expect_err("A lane target at u32::MAX must be rejected before ratcheting.");
+
+    assert_eq!(err, SecretTreeError::RatchetTooLong);
+    assert_eq!(ratchet.generation(), u32::MAX - 1);
+}
+
+// Lane sends may retain skipped generations, but only the configured receive
+// window of those skipped entries is kept. Awaiting-confirmation entries for
+// actual sends remain available regardless of this pruning.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_prunes_only_skipped_generations() {
+    let provider = &Provider::default();
+    let configuration = SenderRatchetConfiguration::new(1, 10);
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+    let lane = GenerationLaneContext::new(TreeSize::from_leaf_count(1), LeafNodeIndex::new(0));
+
+    let first = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            &configuration,
+        )
+        .expect("Expected first lane generation.");
+    let second = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            &configuration,
+        )
+        .expect("Expected second lane generation.");
+    let third = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            &configuration,
+        )
+        .expect("Expected third lane generation.");
+    assert_eq!((first.0, second.0, third.0), (0, 2, 4));
+
+    // Generation 1 was the oldest skipped entry and is pruned once the
+    // tolerance-1 window keeps generation 3.
+    assert_eq!(
+        ratchet
+            .secret_for_decryption(ciphersuite, provider.crypto(), 1, &configuration)
+            .expect_err("Old skipped generation must be pruned"),
+        SecretTreeError::TooDistantInThePast
+    );
+    ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 3, &configuration)
+        .expect("Newest skipped generation must remain available.");
+
+    // All actual lane sends remain awaiting confirmation and are not removed
+    // by skipped-entry pruning.
+    for generation in [first.0, second.0, third.0] {
+        ratchet
+            .secret_for_decryption(ciphersuite, provider.crypto(), generation, &configuration)
+            .expect("Actual lane generation must remain until confirmation.");
+    }
+}
+
+// Every residue in a four-leaf emulation group selects its own first
+// generation, even when each ratchet starts from the same head. A tree with
+// three active leaves still has four lanes: the unused fourth lane is part of
+// the capacity and must not collapse the stride to three.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_maps_width_four_residues_and_capacity() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let width_four = TreeSize::new(4);
+
+    assert_eq!(width_four.leaf_count(), 4);
+    for residue in 0..4 {
+        let mut ratchet = DualUseRatchet::new(secret.clone());
+        let lane = GenerationLaneContext::new(width_four, LeafNodeIndex::new(residue));
+        let (generation, _) = ratchet
+            .secret_for_encryption_in_generation_lane(
+                ciphersuite,
+                provider.crypto(),
+                lane,
+                configuration,
+            )
+            .expect("every width-four residue must select a generation");
+
+        assert_eq!(generation, residue);
+        assert_eq!(ratchet.generation(), residue + 1);
+    }
+
+    // `from_leaf_count(3)` rounds the requested three active leaves up to the
+    // four-leaf tree needed for lane assignment. Exercise only the three
+    // active residues; the fourth lane remains blank while capacity is four.
+    // This is intentionally a TreeSize/ratchet state check rather than a full
+    // MLS integration fixture with an empty emulation leaf.
+    let capacity_four = TreeSize::from_leaf_count(3);
+    assert_eq!(capacity_four.leaf_count(), 4);
+    let mut ratchet = DualUseRatchet::new(secret);
+    let active_generations = (0..3)
+        .map(|residue| {
+            let lane = GenerationLaneContext::new(capacity_four, LeafNodeIndex::new(residue));
+            ratchet
+                .secret_for_encryption_in_generation_lane(
+                    ciphersuite,
+                    provider.crypto(),
+                    lane,
+                    configuration,
+                )
+                .expect("active width-four residue must send")
+                .0
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(active_generations, vec![0, 1, 2]);
+    assert_eq!(ratchet.generation(), 3);
+}
+
+// Serde must preserve all three pieces of a lane ratchet's state: the head,
+// skipped generations that are Available, and emitted generations that remain
+// AwaitingConfirmation. After restoring, the next send must continue in the
+// same lane rather than restarting from the serialized head.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_serde_preserves_state_and_continues_lane() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let lane = GenerationLaneContext::new(TreeSize::new(2), LeafNodeIndex::new(1));
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    // Lane 1 skips generation 0 and emits generation 1, leaving both entries
+    // in distinct retained states and advancing the head to generation 2.
+    let (generation, _) = ratchet
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            configuration,
+        )
+        .expect("initial lane send");
+    assert_eq!(generation, 1);
+    assert_eq!(ratchet.generation(), 2);
+
+    let serialized = serde_json::to_vec(&ratchet).expect("serialize dual-use ratchet");
+    let mut restored: DualUseRatchet =
+        serde_json::from_slice(&serialized).expect("deserialize dual-use ratchet");
+    assert_eq!(restored.generation(), 2);
+
+    // Available skipped material survives the round-trip and is one-shot.
+    restored
+        .secret_for_decryption(ciphersuite, provider.crypto(), 0, configuration)
+        .expect("restored skipped generation must decrypt");
+    assert_eq!(
+        restored
+            .secret_for_decryption(ciphersuite, provider.crypto(), 0, configuration)
+            .expect_err("consumed skipped generation must reject replay"),
+        SecretTreeError::SecretReuseError
+    );
+
+    // The emitted material is still AwaitingConfirmation and explicit
+    // confirmation removes it before any own echo can be accepted.
+    restored.delete_secret_for_generation(1);
+    assert_eq!(
+        restored
+            .secret_for_decryption(ciphersuite, provider.crypto(), 1, configuration)
+            .expect_err("confirmed lane generation must reject own echo"),
+        SecretTreeError::SecretReuseError
+    );
+
+    // The restored head remains in lane 1: generation 2 is skipped and the
+    // next actual send is generation 3.
+    let (next_generation, _) = restored
+        .secret_for_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            lane,
+            configuration,
+        )
+        .expect("restored ratchet must continue lane assignment");
+    assert_eq!(next_generation, 3);
+    restored
+        .secret_for_decryption(ciphersuite, provider.crypto(), 2, configuration)
+        .expect("restored skipped generation must remain available");
+    restored
+        .secret_for_decryption(ciphersuite, provider.crypto(), 3, configuration)
+        .expect("restored awaiting-confirmation generation must remain available");
+}
+
+// A failed derivation after one skipped generation must leave both the head
+// and retained-secret map unchanged so a caller can retry the lane send.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_generation_lane_mid_derivation_failure_preserves_state() {
+    let configuration = &SenderRatchetConfiguration::default();
+    let crypto = FailingCrypto::failing_on_expand(4);
+    let secret = Secret::from_slice(&[0x42; 32]);
+    let mut ratchet = DualUseRatchet::new(secret);
+    let before = ratchet.clone();
+    let lane = GenerationLaneContext::new(TreeSize::new(4), LeafNodeIndex::new(3));
+
+    let error = ratchet
+        .secret_for_encryption_in_generation_lane(ciphersuite, &crypto, lane, configuration)
+        .expect_err("the second skipped generation must fail deterministically");
+
+    assert_eq!(
+        error,
+        SecretTreeError::CryptoError(CryptoError::CryptoLibraryError)
+    );
+    assert_eq!(ratchet, before);
 }

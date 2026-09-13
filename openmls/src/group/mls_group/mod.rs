@@ -1011,6 +1011,7 @@ impl MlsGroup {
         let emulator_ctx: Option<crate::framing::EmulatorReuseGuardCtx<'_>> = derivation_state
             .as_ref()
             .map(|state| state.reuse_guard_inputs());
+        let sender_ratchet_configuration = *self.configuration().sender_ratchet_configuration();
 
         let msg = PrivateMessage::try_from_authenticated_content(
             provider.crypto(),
@@ -1019,6 +1020,7 @@ impl MlsGroup {
             self.ciphersuite(),
             self.message_secrets_store.message_secrets_mut(),
             padding_size,
+            &sender_ratchet_configuration,
             #[cfg(feature = "virtual-clients-draft")]
             emulator_ctx.as_ref(),
         )?;

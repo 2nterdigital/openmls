@@ -5,7 +5,7 @@ use tls_codec::{Error as TlsCodecError, TlsSerialize, TlsSize};
 
 use super::*;
 #[cfg(feature = "virtual-clients-draft")]
-use crate::tree::dual_use_ratchet::DualUseRatchet;
+use crate::tree::dual_use_ratchet::{DualUseRatchet, GenerationLaneContext};
 use crate::{
     binary_tree::{
         array_representation::{
@@ -39,6 +39,18 @@ pub enum SecretTreeError {
     /// Ratchet generation has reached `u32::MAX`.
     #[error("Ratchet generation has reached `u32::MAX`.")]
     RatchetTooLong,
+    /// The emulation group size used for a generation lane is zero.
+    #[cfg(feature = "virtual-clients-draft")]
+    #[error("Generation lane emulation group size must be non-zero.")]
+    GenerationLaneZeroSize,
+    /// The emulation leaf index is not a valid generation-lane residue.
+    #[cfg(feature = "virtual-clients-draft")]
+    #[error("Generation lane residue must be less than emulation group size.")]
+    GenerationLaneInvalidResidue,
+    /// The generation-lane stride exceeds a configured sender-ratchet window.
+    #[cfg(feature = "virtual-clients-draft")]
+    #[error("Generation lane stride exceeds sender ratchet limits.")]
+    GenerationLaneTooWide,
     /// An unrecoverable error has occurred due to a bug in the implementation.
     #[error("An unrecoverable error has occurred due to a bug in the implementation.")]
     LibraryError,
@@ -143,6 +155,14 @@ pub(crate) struct SecretTree {
     handshake_sender_ratchets: Vec<Option<SenderRatchet>>,
     application_sender_ratchets: Vec<Option<SenderRatchet>>,
     size: TreeSize,
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+struct StagedSenderRatchets {
+    index: LeafNodeIndex,
+    node_updates: Vec<(TreeNodeIndex, Option<Secret>)>,
+    handshake_sender_ratchet: SenderRatchet,
+    application_sender_ratchet: SenderRatchet,
 }
 
 impl SecretTree {
@@ -332,6 +352,163 @@ impl SecretTree {
         self.set_node(index.into(), None)
     }
 
+    #[cfg(feature = "virtual-clients-draft")]
+    fn initialize_sender_ratchets_staged(
+        &self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+    ) -> Result<StagedSenderRatchets, SecretTreeError> {
+        log::trace!("Staging sender ratchets for {index:?} with {ciphersuite}");
+        if index.u32() >= self.size.leaf_count() {
+            log::error!("Index is larger than the tree size.");
+            return Err(SecretTreeError::IndexOutOfBounds);
+        }
+
+        let mut node_updates = Vec::new();
+        if self.get_node(index.into())?.is_none() {
+            let mut empty_nodes = Vec::new();
+            let direct_path = direct_path(index, self.size);
+            log::trace!("Direct path for node {index:?}: {direct_path:?}");
+            for parent_node in direct_path {
+                empty_nodes.push(parent_node);
+                if self.get_node(parent_node.into())?.is_some() {
+                    break;
+                }
+            }
+            empty_nodes.reverse();
+
+            for parent_node in empty_nodes {
+                log::trace!("Stage derive down for parent node {parent_node:?}.");
+                let node_secret = self
+                    .staged_node_secret(&node_updates, parent_node.into())?
+                    .ok_or(SecretTreeError::LibraryError)?;
+                let (left_secret, right_secret) =
+                    derive_child_secrets(node_secret, crypto, ciphersuite)?;
+                Self::stage_node(&mut node_updates, left(parent_node), Some(left_secret));
+                Self::stage_node(&mut node_updates, right(parent_node), Some(right_secret));
+                Self::stage_node(&mut node_updates, parent_node.into(), None);
+            }
+        }
+
+        let node_secret = self
+            .staged_node_secret(&node_updates, index.into())?
+            .ok_or(SecretTreeError::LibraryError)?;
+        log::trace!("Deriving staged leaf node secrets for leaf {index:?}");
+        let handshake_ratchet_secret = node_secret.kdf_expand_label(
+            crypto,
+            ciphersuite,
+            "handshake",
+            b"",
+            ciphersuite.hash_length(),
+        )?;
+        let application_ratchet_secret = node_secret.kdf_expand_label(
+            crypto,
+            ciphersuite,
+            "application",
+            b"",
+            ciphersuite.hash_length(),
+        )?;
+
+        let (handshake_sender_ratchet, application_sender_ratchet) = if index == self.own_index {
+            (
+                SenderRatchet::DualUse(DualUseRatchet::new(handshake_ratchet_secret)),
+                SenderRatchet::DualUse(DualUseRatchet::new(application_ratchet_secret)),
+            )
+        } else {
+            (
+                SenderRatchet::DecryptionRatchet(DecryptionRatchet::new(handshake_ratchet_secret)),
+                SenderRatchet::DecryptionRatchet(DecryptionRatchet::new(
+                    application_ratchet_secret,
+                )),
+            )
+        };
+
+        Self::stage_node(&mut node_updates, index.into(), None);
+        Ok(StagedSenderRatchets {
+            index,
+            node_updates,
+            handshake_sender_ratchet,
+            application_sender_ratchet,
+        })
+    }
+
+    #[cfg(feature = "virtual-clients-draft")]
+    fn staged_node_secret<'a>(
+        &'a self,
+        node_updates: &'a [(TreeNodeIndex, Option<Secret>)],
+        index: TreeNodeIndex,
+    ) -> Result<Option<&'a Secret>, SecretTreeError> {
+        if let Some((_, node)) = node_updates
+            .iter()
+            .rev()
+            .find(|(node_index, _)| *node_index == index)
+        {
+            return Ok(node.as_ref());
+        }
+        Ok(self.get_node(index)?.map(|node| &node.secret))
+    }
+
+    #[cfg(feature = "virtual-clients-draft")]
+    fn stage_node(
+        node_updates: &mut Vec<(TreeNodeIndex, Option<Secret>)>,
+        index: TreeNodeIndex,
+        node: Option<Secret>,
+    ) {
+        if let Some((_, staged_node)) = node_updates
+            .iter_mut()
+            .rev()
+            .find(|(node_index, _)| *node_index == index)
+        {
+            *staged_node = node;
+        } else {
+            node_updates.push((index, node));
+        }
+    }
+
+    #[cfg(feature = "virtual-clients-draft")]
+    fn commit_staged_sender_ratchets(
+        &mut self,
+        staged: StagedSenderRatchets,
+    ) -> Result<(), SecretTreeError> {
+        let index = staged.index;
+        if index.u32() >= self.size.leaf_count()
+            || self.handshake_sender_ratchets.get(index.usize()).is_none()
+            || self
+                .application_sender_ratchets
+                .get(index.usize())
+                .is_none()
+        {
+            return Err(SecretTreeError::IndexOutOfBounds);
+        }
+        for (node_index, _) in &staged.node_updates {
+            let valid = match node_index {
+                TreeNodeIndex::Leaf(leaf_index) => {
+                    self.leaf_nodes.get(leaf_index.usize()).is_some()
+                }
+                TreeNodeIndex::Parent(parent_index) => {
+                    self.parent_nodes.get(parent_index.usize()).is_some()
+                }
+            };
+            if !valid {
+                return Err(SecretTreeError::IndexOutOfBounds);
+            }
+        }
+
+        for (node_index, node) in staged.node_updates {
+            self.set_node(node_index, node.map(|secret| SecretTreeNode { secret }))?;
+        }
+        *self
+            .handshake_sender_ratchets
+            .get_mut(index.usize())
+            .ok_or(SecretTreeError::IndexOutOfBounds)? = Some(staged.handshake_sender_ratchet);
+        *self
+            .application_sender_ratchets
+            .get_mut(index.usize())
+            .ok_or(SecretTreeError::IndexOutOfBounds)? = Some(staged.application_sender_ratchet);
+        Ok(())
+    }
+
     /// Return RatchetSecrets for a given index and generation. This should be
     /// called when decrypting an PrivateMessage received from another member.
     /// Returns an error if index or generation are out of bound.
@@ -396,6 +573,50 @@ impl SecretTree {
             #[cfg(feature = "virtual-clients-draft")]
             SenderRatchet::DualUse(dual_ratchet) => {
                 dual_ratchet.secret_for_encryption(ciphersuite, crypto)
+            }
+        }
+    }
+
+    /// Return the next key material for a virtual-client application sender
+    /// lane. The ordinary encryption path remains untouched for handshake and
+    /// non-bound messages.
+    #[cfg(feature = "virtual-clients-draft")]
+    pub(crate) fn secret_for_application_encryption_in_generation_lane(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+        lane: GenerationLaneContext,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<(u32, RatchetKeyMaterial), SecretTreeError> {
+        lane.validate(configuration)?;
+        if self
+            .ratchet_opt(index, SecretType::ApplicationSecret)?
+            .is_none()
+        {
+            let mut staged = self.initialize_sender_ratchets_staged(ciphersuite, crypto, index)?;
+            let result = match &mut staged.application_sender_ratchet {
+                SenderRatchet::DualUse(dual_ratchet) => dual_ratchet
+                    .secret_for_encryption_in_generation_lane(
+                        ciphersuite,
+                        crypto,
+                        lane,
+                        configuration,
+                    ),
+                SenderRatchet::EncryptionRatchet(_) | SenderRatchet::DecryptionRatchet(_) => {
+                    log::error!("Invalid ratchet type for a generation lane.");
+                    Err(SecretTreeError::RatchetTypeError)
+                }
+            }?;
+            self.commit_staged_sender_ratchets(staged)?;
+            return Ok(result);
+        }
+        match self.ratchet_mut(index, SecretType::ApplicationSecret)? {
+            SenderRatchet::DualUse(dual_ratchet) => dual_ratchet
+                .secret_for_encryption_in_generation_lane(ciphersuite, crypto, lane, configuration),
+            SenderRatchet::EncryptionRatchet(_) | SenderRatchet::DecryptionRatchet(_) => {
+                log::error!("Invalid ratchet type for a generation lane.");
+                Err(SecretTreeError::RatchetTypeError)
             }
         }
     }

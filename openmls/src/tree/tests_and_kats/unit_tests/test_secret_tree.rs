@@ -1,11 +1,70 @@
 use openmls_traits::random::OpenMlsRand;
+#[cfg(feature = "virtual-clients-draft")]
+use openmls_traits::types::CryptoError;
 
+#[cfg(feature = "virtual-clients-draft")]
+use super::test_sender_ratchet::FailingCrypto;
+#[cfg(feature = "virtual-clients-draft")]
+use crate::tree::dual_use_ratchet::GenerationLaneContext;
 use crate::{
     binary_tree::{array_representation::TreeSize, LeafNodeIndex},
     schedule::EncryptionSecret,
     tree::{secret_tree::*, sender_ratchet::SenderRatchetConfiguration},
 };
 use std::collections::HashMap;
+
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn invalid_generation_lane_does_not_initialize_secret_tree() {
+    let provider = &Provider::default();
+    let encryption_secret = EncryptionSecret::random(ciphersuite, provider.rand());
+    let mut secret_tree =
+        SecretTree::new(encryption_secret, TreeSize::new(2), LeafNodeIndex::new(0));
+    let before = secret_tree.clone();
+    let invalid_lane = GenerationLaneContext::new(TreeSize::new(2), LeafNodeIndex::new(2));
+
+    let err = secret_tree
+        .secret_for_application_encryption_in_generation_lane(
+            ciphersuite,
+            provider.crypto(),
+            LeafNodeIndex::new(0),
+            invalid_lane,
+            &SenderRatchetConfiguration::default(),
+        )
+        .expect_err("invalid lane must be rejected before sender-ratchet initialization");
+
+    assert_eq!(err, SecretTreeError::GenerationLaneInvalidResidue);
+    assert_eq!(secret_tree, before);
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn generation_lane_initialization_failure_leaves_secret_tree_unchanged() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let crypto = FailingCrypto::failing_on_expand(3);
+    let encryption_secret = EncryptionSecret::random(ciphersuite, provider.rand());
+    let mut secret_tree =
+        SecretTree::new(encryption_secret, TreeSize::new(4), LeafNodeIndex::new(0));
+    let before = secret_tree.clone();
+    let lane = GenerationLaneContext::new(TreeSize::new(4), LeafNodeIndex::new(0));
+
+    let error = secret_tree
+        .secret_for_application_encryption_in_generation_lane(
+            ciphersuite,
+            &crypto,
+            LeafNodeIndex::new(0),
+            lane,
+            configuration,
+        )
+        .expect_err("the second tree derivation must fail deterministically");
+
+    assert_eq!(
+        error,
+        SecretTreeError::CryptoError(CryptoError::CryptoLibraryError)
+    );
+    assert_eq!(secret_tree, before);
+}
 
 // This tests the boundaries of the generations from a SecretTree
 #[openmls_test::openmls_test]

@@ -189,6 +189,20 @@ impl RatchetSecret {
         crypto: &impl OpenMlsCrypto,
         ciphersuite: Ciphersuite,
     ) -> Result<(Generation, RatchetKeyMaterial), SecretTreeError> {
+        let (next_head, generation, key_material) =
+            self.ratchet_forward_staged(crypto, ciphersuite)?;
+        *self = next_head;
+        Ok((generation, key_material))
+    }
+
+    /// Derive the next ratchet head and key material without mutating this
+    /// head. Callers that need transactional state transitions can stage the
+    /// returned head and commit it only after all derivations succeed.
+    pub(crate) fn ratchet_forward_staged(
+        &self,
+        crypto: &impl OpenMlsCrypto,
+        ciphersuite: Ciphersuite,
+    ) -> Result<(Self, Generation, RatchetKeyMaterial), SecretTreeError> {
         log::trace!("Ratcheting forward in generation {}.", self.generation);
         log_crypto!(trace, "    with secret {:x?}", self.secret);
 
@@ -212,7 +226,7 @@ impl RatchetSecret {
             ciphersuite.aead_key_length(),
             crypto,
         )?;
-        self.secret = derive_tree_secret(
+        let next_secret = derive_tree_secret(
             ciphersuite,
             &self.secret,
             "secret",
@@ -221,8 +235,15 @@ impl RatchetSecret {
             crypto,
         )?;
         let generation = self.generation;
-        self.generation += 1;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(SecretTreeError::RatchetTooLong)?;
+        let next_head = Self {
+            secret: next_secret,
+            generation: next_generation,
+        };
         Ok((
+            next_head,
             generation,
             (
                 AeadKey::from_secret(key, ciphersuite),

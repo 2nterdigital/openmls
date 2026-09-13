@@ -5,13 +5,18 @@ use tls_codec::{Serialize, Size, TlsSerialize, TlsSize};
 use super::mls_auth_content::AuthenticatedContent;
 
 use crate::{
-    binary_tree::array_representation::LeafNodeIndex, error::LibraryError,
-    tree::secret_tree::SecretType, tree::sender_ratchet::Generation,
+    binary_tree::array_representation::LeafNodeIndex,
+    error::LibraryError,
+    tree::{
+        secret_tree::SecretType,
+        sender_ratchet::{Generation, SenderRatchetConfiguration},
+    },
 };
 
 #[cfg(feature = "virtual-clients-draft")]
 use crate::{
     binary_tree::array_representation::TreeSize, components::vc_derivation_info::ReuseGuardSecret,
+    tree::dual_use_ratchet::GenerationLaneContext,
 };
 
 use super::*;
@@ -120,6 +125,7 @@ impl PrivateMessage {
     ///
     /// TODO #1148: Refactor theses constructors to avoid test code in main and
     /// to avoid validation using a special feature flag.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_from_authenticated_content<T>(
         crypto: &impl OpenMlsCrypto,
         rand: &impl OpenMlsRand,
@@ -127,6 +133,7 @@ impl PrivateMessage {
         ciphersuite: Ciphersuite,
         message_secrets: &mut MessageSecrets,
         padding_size: usize,
+        sender_ratchet_configuration: &SenderRatchetConfiguration,
         #[cfg(feature = "virtual-clients-draft")] emulator_ctx: Option<&EmulatorReuseGuardCtx<'_>>,
     ) -> Result<EncryptionOutput, MessageEncryptionError<T>> {
         log::debug!("PrivateMessage::try_from_authenticated_content");
@@ -143,6 +150,7 @@ impl PrivateMessage {
             ciphersuite,
             message_secrets,
             padding_size,
+            sender_ratchet_configuration,
             #[cfg(feature = "virtual-clients-draft")]
             emulator_ctx,
         )
@@ -165,6 +173,7 @@ impl PrivateMessage {
             ciphersuite,
             message_secrets,
             padding_size,
+            &SenderRatchetConfiguration::default(),
             #[cfg(feature = "virtual-clients-draft")]
             None,
         )
@@ -188,6 +197,7 @@ impl PrivateMessage {
             ciphersuite,
             message_secrets,
             padding_size,
+            &SenderRatchetConfiguration::default(),
             #[cfg(feature = "virtual-clients-draft")]
             None,
         )
@@ -204,6 +214,7 @@ impl PrivateMessage {
         ciphersuite: Ciphersuite,
         message_secrets: &mut MessageSecrets,
         padding_size: usize,
+        _sender_ratchet_configuration: &SenderRatchetConfiguration,
         #[cfg(feature = "virtual-clients-draft")] emulator_ctx: Option<&EmulatorReuseGuardCtx<'_>>,
     ) -> Result<EncryptionOutput, MessageEncryptionError<T>> {
         // https://validation.openmls.tech/#valn1305
@@ -233,10 +244,36 @@ impl PrivateMessage {
             .map_err(LibraryError::missing_bound_check)?;
         // Extract generation and key material for encryption
         let secret_type = SecretType::from(&public_message.content().content_type());
-        let (generation, (ratchet_key, ratchet_nonce)) = message_secrets
-            .secret_tree_mut()
-            // Even in tests we want to use the real sender index, so we have a key to encrypt.
-            .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?;
+        let (generation, (ratchet_key, ratchet_nonce)) = {
+            #[cfg(feature = "virtual-clients-draft")]
+            if let (SecretType::ApplicationSecret, Some(ctx)) = (secret_type, emulator_ctx) {
+                message_secrets
+                    .secret_tree_mut()
+                    // Even in tests we want to use the real sender index, so we have a key to encrypt.
+                    .secret_for_application_encryption_in_generation_lane(
+                        ciphersuite,
+                        crypto,
+                        sender_index,
+                        GenerationLaneContext::new(
+                            ctx.emulation_group_size,
+                            ctx.emulation_leaf_index,
+                        ),
+                        _sender_ratchet_configuration,
+                    )?
+            } else {
+                message_secrets
+                    .secret_tree_mut()
+                    // Even in tests we want to use the real sender index, so we have a key to encrypt.
+                    .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?
+            }
+            #[cfg(not(feature = "virtual-clients-draft"))]
+            {
+                message_secrets
+                    .secret_tree_mut()
+                    // Even in tests we want to use the real sender index, so we have a key to encrypt.
+                    .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?
+            }
+        };
         // Derive the reuse guard deterministically when the group is
         // bound to a derivation epoch, otherwise sample at random.
         #[cfg(feature = "virtual-clients-draft")]

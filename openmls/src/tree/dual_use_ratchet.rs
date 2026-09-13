@@ -10,6 +10,7 @@ use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::Ciphersuite;
 use serde::{Deserialize, Serialize};
 
+use crate::binary_tree::{array_representation::TreeSize, LeafNodeIndex};
 use crate::ciphersuite::Secret;
 use crate::tree::secret_tree::SecretTreeError;
 use crate::tree::sender_ratchet::{
@@ -48,6 +49,48 @@ enum DualUsePastSecret {
 enum RetainedDecryptionSecret {
     Available(RatchetKeyMaterial),
     Consumed,
+}
+
+/// Coordinates for a virtual-client generation lane. A sender uses the
+/// emulation group's leaf index as its residue modulo the emulation group's
+/// leaf count.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GenerationLaneContext {
+    pub(crate) emulation_group_size: TreeSize,
+    pub(crate) emulation_leaf_index: LeafNodeIndex,
+}
+
+impl GenerationLaneContext {
+    pub(crate) fn new(emulation_group_size: TreeSize, emulation_leaf_index: LeafNodeIndex) -> Self {
+        Self {
+            emulation_group_size,
+            emulation_leaf_index,
+        }
+    }
+
+    pub(crate) fn validate(
+        self,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<(u32, u32), SecretTreeError> {
+        let emulation_group_size = self.emulation_group_size.leaf_count();
+        let residue = self.emulation_leaf_index.u32();
+        if emulation_group_size == 0 {
+            return Err(SecretTreeError::GenerationLaneZeroSize);
+        }
+        if residue >= emulation_group_size {
+            return Err(SecretTreeError::GenerationLaneInvalidResidue);
+        }
+
+        let lane_stride = emulation_group_size
+            .checked_sub(1)
+            .ok_or(SecretTreeError::GenerationLaneZeroSize)?;
+        if lane_stride > configuration.out_of_order_tolerance()
+            || lane_stride > configuration.maximum_forward_distance()
+        {
+            return Err(SecretTreeError::GenerationLaneTooWide);
+        }
+        Ok((emulation_group_size, residue))
+    }
 }
 
 impl DualUsePastSecret {
@@ -97,6 +140,11 @@ impl DualUseRatchet {
         self.ratchet_head.generation()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_generation_for_test(&mut self, generation: Generation) {
+        self.ratchet_head.set_generation(generation);
+    }
+
     /// Discard the cached encryption secret for a previously emitted
     /// generation. Call this to confirm a sent message and drop the
     /// corresponding key material for forward secrecy.
@@ -140,6 +188,71 @@ impl DualUseRatchet {
             DualUsePastSecret::AwaitingConfirmation(ratchet_secrets.clone()),
         );
         Ok((generation, ratchet_secrets))
+    }
+
+    /// Gets key material for the first generation in this sender's virtual-
+    /// client lane. Generations skipped to reach the lane are retained for
+    /// decryption because a sibling may have emitted one of them.
+    pub(crate) fn secret_for_encryption_in_generation_lane(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        lane: GenerationLaneContext,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<(Generation, RatchetKeyMaterial), SecretTreeError> {
+        // Validate the complete lane before mutating the ratchet head. The
+        // SecretTree entry point performs the same pure check before lazily
+        // initializing sender ratchets.
+        let (emulation_group_size, residue) = lane.validate(configuration)?;
+
+        let head_generation = self.ratchet_head.generation();
+        let head_residue = head_generation % emulation_group_size;
+        let distance = if residue >= head_residue {
+            residue - head_residue
+        } else {
+            emulation_group_size
+                .checked_sub(head_residue)
+                .and_then(|distance| distance.checked_add(residue))
+                .ok_or(SecretTreeError::RatchetTooLong)?
+        };
+        let target_generation = head_generation
+            .checked_add(distance)
+            .ok_or(SecretTreeError::RatchetTooLong)?;
+        if target_generation == u32::MAX {
+            return Err(SecretTreeError::RatchetTooLong);
+        }
+
+        // Stage every derived secret in local state first. A provider failure
+        // must not advance the head or leave a partial retention window for a
+        // caller that may retry the same lane send.
+        let mut staged_past_secrets = BTreeMap::new();
+        let (mut staged_head, _, mut ratchet_secret) = self
+            .ratchet_head
+            .ratchet_forward_staged(crypto, ciphersuite)?;
+        let mut skipped_generation = head_generation;
+        while skipped_generation < target_generation {
+            staged_past_secrets.insert(
+                skipped_generation,
+                DualUsePastSecret::RetainedForDecryption(RetainedDecryptionSecret::Available(
+                    ratchet_secret,
+                )),
+            );
+            skipped_generation += 1;
+
+            let (next_head, _, next_secret) =
+                staged_head.ratchet_forward_staged(crypto, ciphersuite)?;
+            staged_head = next_head;
+            ratchet_secret = next_secret;
+        }
+        staged_past_secrets.insert(
+            target_generation,
+            DualUsePastSecret::AwaitingConfirmation(ratchet_secret.clone()),
+        );
+
+        self.ratchet_head = staged_head;
+        self.past_secrets.extend(staged_past_secrets);
+        self.prune_past_secrets(configuration);
+        Ok((target_generation, ratchet_secret))
     }
 
     /// Gets a secret for decryption.

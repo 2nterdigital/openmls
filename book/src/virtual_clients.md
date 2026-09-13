@@ -288,10 +288,14 @@ window as the message secrets store.
 
 When the group frames handshake messages as PrivateMessage (a ciphertext
 outgoing wire format policy), proposals and commits draw their generations from
-the per-leaf handshake ratchet, the same way application messages draw from the
-application ratchet. Like an application send, a private handshake send retains
-its key and nonce until the Delivery Service accepts it, so two emulator clients
-that race for the same handshake generation can both recover.
+the per-leaf handshake ratchet. Handshake traffic continues to use that
+ordinary sequential ratchet and is not assigned an application generation lane.
+A plaintext PublicMessage has no sender-ratchet generation at all. Like an
+application send, a private handshake send retains its key and nonce until the
+Delivery Service accepts it. Sibling handshake proposals and commits still
+require sequential admission; a generation collision is surfaced through the
+existing generation ID rather than made independently admissible by the
+application lane.
 
 A commit framed as PrivateMessage exposes its confirmation data on the bundle.
 Take it out with `take_confirmation` before consuming the bundle, since the
@@ -378,6 +382,46 @@ confirmation from the bundle's `confirmation()` as shown above.
 With the feature enabled, the single-shot `create_message` is replaced by a two
 step send flow, because two emulator clients can race for the same ratchet
 generation.
+
+### Application generation lanes
+
+Generation lanes coordinate only virtual-client application messages. For each
+derivation epoch, let `N_e` be the emulation group's `TreeSize` leaf capacity
+(`TreeSize::leaf_count()`), including blank leaf slots. It is the capacity of
+the tree, not the number of currently occupied emulator leaves. An emulator
+client's emulation-group `leaf_index` is its lane residue. Given the current
+MLS application sender-ratchet head, a send selects the smallest actual MLS
+sender generation `g >= head` such that:
+
+```text
+g mod N_e = leaf_index
+```
+
+The ratchet advances through any generations before `g`. Those skipped
+generations are retained as decryption material for a legitimate ciphertext
+from another sibling; they do not produce phantom ciphertexts or generation
+IDs. Skipped material is subject to the configured receive window. The actual
+generation `g` is the one used for encryption and remains retained as awaiting
+confirmation until the Delivery Service accepts the message (or processing the
+message consumes it). Call `confirm_application_message` with that generation
+after acceptance.
+
+The lane stride is `N_e - 1`. A lane send fails closed before ratchet state is
+advanced when this stride exceeds either `SenderRatchetConfiguration` window:
+`out_of_order_tolerance` or `maximum_forward_distance`. Configure both windows
+to be at least `N_e - 1` before sending application messages from a bound group.
+
+This scheduling does not change `PrivateMessage`, `GenerationId`, or any wire
+format. The existing `PrivateMessage` fields and serialization are used, and
+the `GenerationId` still derives from the existing `PrivateMessageContext`
+using the actual generation `g` and `RatchetType::Application`; no lane marker
+is added to the wire.
+
+When emulation-group membership changes, its new derivation epoch records the
+post-change tree's leaf capacity and the emulator client's new leaf index. The
+next application send therefore recomputes `N_e` and its residue from that new
+epoch tree. Bindings for older higher-level epochs continue to use their own
+recorded derivation-epoch state for delayed messages.
 
 `create_unconfirmed_message` encrypts the payload, retains the key and nonce,
 and returns the message together with the ratchet `generation` and a
